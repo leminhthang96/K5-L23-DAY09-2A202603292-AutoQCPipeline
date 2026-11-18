@@ -35,5 +35,104 @@ from ..common import ERROR, parse_yolo_line  # noqa: F401
 
 
 def fix(ds, issues, cfg):
-    # TODO
-    raise NotImplementedError("autofix chưa làm")
+    changes = []
+    drop_codes = {"BAD_FORMAT", "BAD_CLASS_ID", "BOX_ZERO", "DUP_BOX"}
+    remove_codes = {"LEAK_TEST", "CORRUPT_IMAGE", "BAD_SIZE"}
+    remove_stems = set()
+    missing_stems = set()
+    line_errors = defaultdict(lambda: defaultdict(set))
+    rename_classes = False
+
+    def record(image, line, action, before, after):
+        changes.append(dict(
+            image=image, line=line, action=action, before=before, after=after,
+        ))
+
+    for issue in issues:
+        if issue.severity != ERROR:
+            continue
+        if issue.code.startswith("DUP_IMAGE_") or issue.code in remove_codes:
+            remove_stems.add(issue.image)
+        elif issue.code == "MISSING_LABEL_FILE":
+            missing_stems.add(issue.image)
+        elif issue.code == "BAD_CLASS_NAME":
+            rename_classes = True
+        elif (issue.code in drop_codes or issue.code == "BOX_OUT_OF_IMAGE"):
+            if issue.line is not None:
+                line_errors[issue.image][issue.line].add(issue.code)
+
+    # Xóa ảnh trước; không xử lý thêm lỗi dòng của những ảnh này.
+    image_paths = defaultdict(list)
+    for path in ds.image_files():
+        image_paths[path.stem].append(path)
+    for stem in sorted(remove_stems):
+        paths = image_paths[stem] + [ds.label_path(stem)]
+        existing_paths = [path for path in paths if path.exists()]
+        if existing_paths:
+            before = "; ".join(str(path) for path in existing_paths)
+            for path in existing_paths:
+                path.unlink()
+            record(stem, None, "remove_image", before, "")
+
+    if rename_classes and ds.yaml_path.exists():
+        expected_names = dict(enumerate(cfg["classes"]))
+        if ds.yaml_names() != expected_names:
+            before = ds.yaml_path.read_text(encoding="utf-8")
+            data = yaml.safe_load(before) or {}
+            data["names"] = list(cfg["classes"])
+            after = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
+            ds.yaml_path.write_text(after, encoding="utf-8")
+            record("data.yaml", None, "rename_classes", before, after)
+
+    for stem in sorted(missing_stems - remove_stems):
+        if not ds.label_path(stem).exists():
+            record(stem, None, "needs_label", "(không có file)", "chuyển người gán")
+
+    for stem, errors_by_line in sorted(line_errors.items()):
+        path = ds.label_path(stem)
+        if stem in remove_stems or not path.exists():
+            continue
+
+        original = path.read_text(encoding="utf-8", errors="replace")
+        output = []
+        changed = False
+        # Giữ cả dòng trống và ký tự xuống dòng; chỉ ghi file một lần.
+        for line_number, raw_line in enumerate(original.splitlines(keepends=True), 1):
+            codes = errors_by_line.get(line_number, set())
+            before = raw_line.rstrip("\r\n")
+            if codes & drop_codes:
+                record(stem, line_number, "drop_line", before, "")
+                changed = True
+                continue
+
+            if "BOX_OUT_OF_IMAGE" in codes:
+                try:
+                    class_id, cx, cy, w, h = parse_yolo_line(before)
+                except ValueError:
+                    output.append(raw_line)
+                    continue
+
+                left, top = cx - w / 2, cy - h / 2
+                right, bottom = cx + w / 2, cy + h / 2
+                x1, y1 = max(0.0, left), max(0.0, top)
+                x2, y2 = min(1.0, right), min(1.0, bottom)
+                if x2 <= x1 or y2 <= y1:
+                    record(stem, line_number, "drop_line", before, "")
+                    changed = True
+                    continue
+
+                if (x1, y1, x2, y2) != (left, top, right, bottom):
+                    clipped = ((x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1)
+                    after = f"{class_id} " + " ".join(f"{v:.12g}" for v in clipped)
+                    ending = raw_line[len(before):]
+                    output.append(after + ending)
+                    record(stem, line_number, "clip_box", before, after)
+                    changed = True
+                    continue
+
+            output.append(raw_line)
+
+        if changed:
+            path.write_text("".join(output), encoding="utf-8")
+
+    return changes
